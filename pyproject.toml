@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "go-fusion"
+version = "0.1.0"
+description = "Reproducing GO (Graph Optimizer) operation fusion task from 'Transferable Graph Optimizers for ML Compilers' (NeurIPS 2020)"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.1.0",
+    "torch-geometric>=2.4.0",
+    "gymnasium>=0.29.0",
+    "pyyaml>=6.0",
+    "matplotlib>=3.7.0",
+    "networkx>=3.0",
+    "tensorboard>=2.14.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

@@ -1,0 +1,23 @@
+# GO Fusion - Reproducing operation fusion from "Transferable Graph Optimizers for ML Compilers"
+
+# Core ML
+torch>=2.1.0
+torch-geometric>=2.4.0
+
+# RL Environment
+gymnasium>=0.29.0
+
+# Configuration
+pyyaml>=6.0
+
+# Visualization & Logging
+matplotlib>=3.7.0
+networkx>=3.0
+tensorboard>=2.14.0
+
+# Data & Utils
+numpy>=1.24.0
+tqdm>=4.65.0
+
+# Testing
+pytest>=7.4.0
