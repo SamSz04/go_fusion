@@ -3,16 +3,18 @@ Fusion legality rules for the GO fusion system.
 
 ``FusionRules`` encodes the constraints that decide whether two HLO nodes
 (or two clusters of nodes) may be legally merged into a single fused kernel.
-The rules mirror the key restrictions from XLA's fusion passes:
+The rules mirror the key restrictions from XLA's ``PriorityFusion`` pass:
 
-1. Both sides must be fusable (not bare parameters / constants).
-2. A dataflow edge must connect the producer to the consumer.
-3. The merge must not introduce a cycle in the cluster-level DAG.
-4. The merged cluster must not exceed a size cap (default 64 instructions).
-5. ``custom-call`` nodes (e.g. cuBLAS GEMMs) act as *barriers*: they cannot
-   be absorbed into another cluster, but their **outputs** may be consumed
-   by a downstream fusion.
-6. Reductions may fuse with their element-wise inputs.
+1. Root check: cannot fuse the computation's root instruction.
+2. Both sides must be fusable (not bare parameters / constants).
+3. Bitcast consumer: cannot fuse into a standalone bitcast consumer.
+4. Reduce-into-reduce: forbid fusing a producer containing a significant
+   reduction into a consumer also containing a reduction.
+5. The merged cluster must not exceed a size cap (default 64 instructions).
+6. Parameter budget: merged cluster must not have too many external inputs.
+7. Merging must not create a cycle in the cluster-level DAG.
+8. ``custom-call`` nodes (e.g. cuBLAS GEMMs) act as *barriers*: they cannot
+   be absorbed into another cluster.
 """
 
 from __future__ import annotations
@@ -67,6 +69,14 @@ class FusionRules:
     # Maximum number of instructions in a single fused cluster.
     MAX_CLUSTER_SIZE: int = 64
 
+    # Maximum number of unique external inputs (parameters) to a fused cluster.
+    # Mirrors XLA's FusionFitsInBudget parameter limit.
+    MAX_PARAMETERS: int = 64
+
+    # Minimum number of elements in a reduction to be considered "significant".
+    # XLA uses 16 as the threshold for the reduce-into-reduce check.
+    REDUCTION_SIZE_THRESHOLD: int = 16
+
     # ------------------------------------------------------------------
     # Fusability predicates
     # ------------------------------------------------------------------
@@ -103,6 +113,17 @@ class FusionRules:
     ) -> bool:
         """Decide whether the clusters of *producer* and *consumer* may merge.
 
+        Checks are ordered to match XLA's ``CanFuse`` sequence:
+        1. Root check — cannot fuse the computation's root.
+        2. Both must be individually fusable.
+        3. Bitcast consumer exclusion.
+        4. They must already be in *different* clusters.
+        5. A dataflow edge must connect producer to consumer.
+        6. Reduce-into-reduce prevention.
+        7. Merged cluster must not exceed the size limit.
+        8. Parameter budget (external input count).
+        9. Merging must not create a cycle in the cluster-level DAG.
+
         Args:
             producer: The upstream instruction.
             consumer: The downstream instruction.
@@ -118,11 +139,19 @@ class FusionRules:
         if max_cluster_size is None:
             max_cluster_size = cls.MAX_CLUSTER_SIZE
 
-        # 1. Both must be individually fusable.
+        # 1. Root check — cannot fuse the computation's root.
+        if getattr(producer, "is_root", False):
+            return False
+
+        # 2. Both must be individually fusable.
         if not cls.is_fusable(producer) or not cls.is_fusable(consumer):
             return False
 
-        # 2. They must already be in *different* clusters.
+        # 3. Bitcast consumer exclusion — cannot fuse into a standalone bitcast.
+        if consumer.opcode == "bitcast":
+            return False
+
+        # 4. They must already be in *different* clusters.
         pid = cluster_of.get(producer.name)
         cid = cluster_of.get(consumer.name)
         if pid is None or cid is None:
@@ -130,22 +159,77 @@ class FusionRules:
         if pid == cid:
             return False  # already fused
 
-        # 3. There must be a dataflow edge from producer to consumer.
+        # 5. There must be a dataflow edge from producer to consumer.
         if producer.name not in consumer.operand_names:
             return False
 
-        # 4. Merged cluster must not exceed the size limit.
+        # 6. Reduce-into-reduce prevention.
+        if cls._has_significant_reduce(cluster_members[pid], instruction_map) and \
+           cls._has_significant_reduce(cluster_members[cid], instruction_map):
+            return False
+
+        # 7. Merged cluster must not exceed the size limit.
         merged_size = len(cluster_members[pid]) + len(cluster_members[cid])
         if merged_size > max_cluster_size:
             return False
 
-        # 5. Merging must not create a cycle in the cluster-level DAG.
+        # 8. Parameter budget (external input count).
+        merged_members = cluster_members[pid] | cluster_members[cid]
+        if cls._parameter_count(merged_members, instruction_map) > cls.MAX_PARAMETERS:
+            return False
+
+        # 9. Merging must not create a cycle in the cluster-level DAG.
         if cls.would_create_cycle(
             pid, cid, cluster_of, cluster_members, adjacency,
         ):
             return False
 
         return True
+
+    # ------------------------------------------------------------------
+    # Helper: reduce-into-reduce detection
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _has_significant_reduce(
+        cls,
+        cluster_members: Set[str],
+        instruction_map: Dict[str, HloInstruction],
+    ) -> bool:
+        """Return True if the cluster contains a reduction over >= threshold elements."""
+        for name in cluster_members:
+            inst = instruction_map.get(name)
+            if inst is None:
+                continue
+            if inst.opcode == "reduce":
+                if inst.shape.num_elements >= cls.REDUCTION_SIZE_THRESHOLD:
+                    return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Helper: parameter budget
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _parameter_count(
+        cls,
+        cluster_members: Set[str],
+        instruction_map: Dict[str, HloInstruction],
+    ) -> int:
+        """Count unique external inputs to a cluster.
+
+        An external input is any operand whose producer is NOT a member
+        of the cluster.
+        """
+        external_inputs: Set[str] = set()
+        for name in cluster_members:
+            inst = instruction_map.get(name)
+            if inst is None:
+                continue
+            for op_name in inst.operand_names:
+                if op_name not in cluster_members:
+                    external_inputs.add(op_name)
+        return len(external_inputs)
 
     # ------------------------------------------------------------------
     # Cycle detection

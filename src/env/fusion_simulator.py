@@ -3,11 +3,20 @@ Priority-based fusion simulation with Union-Find cluster management.
 
 Given a set of HLO instructions, dataflow edges, and per-node priority
 scores, this module simulates XLA-style operator fusion by greedily
-merging producer-consumer pairs in descending priority order, subject to
-the legality constraints in ``src.env.fusion_rules.FusionRules``.
+merging each **producer into ALL its consumers** simultaneously (all-or-
+nothing), in descending priority order, subject to the legality
+constraints in ``src.env.fusion_rules.FusionRules``.
 
-The core data structure is a **Union-Find** (disjoint-set) that supports
-near-constant-time merges and lookups.
+Key XLA-aligned behaviors:
+
+* **All-or-nothing**: a producer is fused into ALL its non-barrier
+  consumers or into none.  If any consumer fails the legality check,
+  the entire merge is skipped.
+* **Special-case priorities**: fusible bitcasts are fused first
+  (priority = +inf, they're no-ops); constants are fused last in a
+  separate pass.
+* **Union-Find** (disjoint-set) for near-constant-time merges and
+  lookups.
 """
 
 from __future__ import annotations
@@ -106,17 +115,20 @@ def simulate_fusion(
     fusion_rules: Optional[FusionRules] = None,
     max_cluster_size: int = FusionRules.MAX_CLUSTER_SIZE,
 ) -> List[FusionCluster]:
-    """Simulate priority-based operator fusion.
+    """Simulate XLA-style priority-based operator fusion.
 
-    Algorithm:
+    Algorithm (aligned with XLA ``PriorityFusion``):
 
-    1. Initialise every fusable node in its own singleton cluster
-       (using Union-Find).
-    2. Sort fusable nodes by their priority score in descending order.
-    3. For each node in that order, attempt to merge its cluster with each
-       of its *consumers'* clusters, accepting the merge only when the
-       ``FusionRules.can_fuse`` check passes.
-    4. Collect and return the final set of clusters.
+    1. Initialise every node in its own singleton cluster (Union-Find).
+    2. **Pre-pass**: fuse all fusible bitcasts first (priority = +inf).
+    3. Sort fusable producers by their priority score in descending order.
+    4. For each producer in that order (**all-or-nothing**):
+       a. Find ALL non-barrier consumer clusters.
+       b. Check if the producer can fuse with ALL of them.
+       c. If any check fails, skip this producer entirely.
+       d. If all pass, merge the producer into every consumer cluster.
+    5. **Post-pass**: fuse remaining small constants (1 element) into users.
+    6. Collect and return the final set of clusters.
 
     Args:
         instructions: All HLO instructions in the graph.
@@ -147,9 +159,7 @@ def simulate_fusion(
 
     # -- Initialise Union-Find and cluster bookkeeping --
     uf = UnionFind()
-    # cluster_of: instruction_name -> cluster_id (we use integers).
     cluster_of: Dict[str, int] = {}
-    # cluster_members: cluster_id -> set of member names.
     cluster_members: Dict[int, Set[str]] = {}
 
     next_cluster_id = 0
@@ -160,69 +170,131 @@ def simulate_fusion(
         cluster_of[inst.name] = cid
         cluster_members[cid] = {inst.name}
 
-    # -- Sort fusable nodes by priority (descending) --
-    fusable_names = [
-        inst.name for inst in instructions
-        if FusionRules.is_fusable(inst)
-    ]
-    fusable_names.sort(key=lambda n: priorities.get(n, 0.0), reverse=True)
+    # Helper: merge producer into a consumer cluster.
+    def _merge(producer_name: str, consumer_name: str) -> None:
+        nonlocal next_cluster_id
 
-    # -- Greedy fusion loop --
-    for producer_name in fusable_names:
-        producer = instruction_map[producer_name]
+        pid = cluster_of[uf.find(producer_name)]
+        cid = cluster_of[uf.find(consumer_name)]
+        if pid == cid:
+            return
 
-        for consumer_name in adjacency.get(producer_name, []):
+        new_root = uf.union(producer_name, consumer_name)
+        merged_members = cluster_members[pid] | cluster_members[cid]
+        new_cid = cluster_of[new_root]
+
+        for member in merged_members:
+            cluster_of[uf.find(member)] = new_cid
+            cluster_of[member] = new_cid
+
+        cluster_members[new_cid] = merged_members
+
+        old_cid = pid if new_cid == cid else cid
+        if old_cid != new_cid and old_cid in cluster_members:
+            del cluster_members[old_cid]
+
+    # Helper: get current cluster_of snapshot for legality checks.
+    def _current_cluster_of() -> Dict[str, int]:
+        return {name: cluster_of[uf.find(name)] for name in instruction_map}
+
+    # ==========================================================
+    # Pre-pass: fuse fusible bitcasts first (priority = +inf)
+    # ==========================================================
+    for inst in instructions:
+        if inst.opcode != "bitcast":
+            continue
+        if not FusionRules.is_fusable(inst):
+            continue
+        producer_name = inst.name
+        consumers = adjacency.get(producer_name, [])
+        for consumer_name in consumers:
             consumer = instruction_map.get(consumer_name)
-            if consumer is None:
+            if consumer is None or not FusionRules.is_fusable(consumer):
                 continue
-
-            # Already in the same cluster?
             if uf.connected(producer_name, consumer_name):
                 continue
+            _merge(producer_name, consumer_name)
 
-            pid = cluster_of[uf.find(producer_name)]
-            cid = cluster_of[uf.find(consumer_name)]
+    # ==========================================================
+    # Main pass: all-or-nothing producer → all consumers
+    # ==========================================================
+    # Collect fusable producers (exclude bitcasts already handled and constants).
+    fusable_producers = [
+        inst.name for inst in instructions
+        if FusionRules.is_fusable(inst)
+        and inst.opcode != "bitcast"
+        and inst.opcode != "constant"
+    ]
+    fusable_producers.sort(key=lambda n: priorities.get(n, 0.0), reverse=True)
 
-            if pid == cid:
+    for producer_name in fusable_producers:
+        producer = instruction_map[producer_name]
+
+        # Skip if producer is root.
+        if getattr(producer, "is_root", False):
+            continue
+
+        # Find all non-barrier consumers.
+        consumer_names = []
+        for cn in adjacency.get(producer_name, []):
+            c = instruction_map.get(cn)
+            if c is None:
                 continue
+            if FusionRules.is_barrier(c):
+                continue
+            # Skip if already in the same cluster.
+            if uf.connected(producer_name, cn):
+                continue
+            consumer_names.append(cn)
 
-            # Check fusion legality.
+        if not consumer_names:
+            continue
+
+        # All-or-nothing: check ALL consumers.
+        current_co = _current_cluster_of()
+        all_legal = True
+        for cn in consumer_names:
+            consumer = instruction_map[cn]
             can_merge = FusionRules.can_fuse(
                 producer=producer,
                 consumer=consumer,
-                cluster_of={
-                    name: cluster_of[uf.find(name)]
-                    for name in instruction_map
-                },
+                cluster_of=current_co,
                 cluster_members=cluster_members,
                 instruction_map=instruction_map,
                 adjacency=adjacency,
                 max_cluster_size=max_cluster_size,
             )
-
             if not can_merge:
+                all_legal = False
+                break
+
+        if not all_legal:
+            continue
+
+        # Merge producer into ALL consumer clusters.
+        for cn in consumer_names:
+            if not uf.connected(producer_name, cn):
+                _merge(producer_name, cn)
+
+    # ==========================================================
+    # Post-pass: fuse small constants into their users
+    # ==========================================================
+    for inst in instructions:
+        if inst.opcode != "constant":
+            continue
+        if inst.shape.num_elements > 1:
+            continue  # only small (scalar) constants
+        producer_name = inst.name
+        consumers = adjacency.get(producer_name, [])
+        for cn in consumers:
+            consumer = instruction_map.get(cn)
+            if consumer is None or not FusionRules.is_fusable(consumer):
                 continue
-
-            # -- Perform the merge --
-            new_root = uf.union(producer_name, consumer_name)
-            # Merge the smaller cluster set into the larger one.
-            merged_members = cluster_members[pid] | cluster_members[cid]
-            new_cid = cluster_of[new_root]
-
-            # Point all members to the surviving cluster id.
-            for member in merged_members:
-                cluster_of[uf.find(member)] = new_cid
-                cluster_of[member] = new_cid
-
-            cluster_members[new_cid] = merged_members
-
-            # Clean up the old cluster id (if different).
-            old_cid = pid if new_cid == cid else cid
-            if old_cid != new_cid and old_cid in cluster_members:
-                del cluster_members[old_cid]
+            if uf.connected(producer_name, cn):
+                continue
+            _merge(producer_name, cn)
 
     # -- Collect final clusters --
-    # Rebuild from Union-Find roots to guarantee consistency.
     root_to_members: Dict[str, Set[str]] = {}
     for inst in instructions:
         root = uf.find(inst.name)

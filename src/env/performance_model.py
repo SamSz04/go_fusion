@@ -1,19 +1,21 @@
 """
-Roofline analytical cost model for HLO instruction clusters.
+XLA-aligned analytical cost model for HLO instruction clusters.
 
-The roofline model estimates kernel runtime as::
+Models kernel runtime using XLA's ``GpuPerformanceModel`` formulation::
 
-    runtime = max(compute_time, memory_time) + kernel_launch_overhead
+    exec_time = max(compute_time, memory_time)
+              + (1 - parallelism) * min(compute_time, memory_time)
+              + kernel_launch_overhead
 
-where:
+where ``parallelism = 0.95`` (XLA's ``kMemoryComputeParallelism``).
 
-* ``compute_time = total_FLOPs / peak_FLOPS``
-* ``memory_time  = bytes_accessed / memory_bandwidth``
+Key improvements over a simple roofline:
 
-This module exposes helpers to compute FLOP counts and byte traffic for
-individual instructions and whole fusion clusters, then combines them
-via the roofline formula using GPU hardware specs from
-``src.utils.gpu_specs.GPUSpecs``.
+* **Compute-memory overlap**: 95% overlap, 5% serialization.
+* **Operand utilization**: broadcast > 1 (re-reads), slice < 1 (subset).
+* **Coalescing approximation**: strided access degrades effective bandwidth.
+* **L1/L2 cache modeling**: small operands get bandwidth multipliers
+  (L1: 8x, L2: 2.5x from ``kL1CacheSpeedup``/``kL2CacheSpeedup``).
 """
 
 from __future__ import annotations
@@ -157,7 +159,111 @@ def compute_flops(
 
 
 # ======================================================================
-# Byte-traffic estimation
+# Operand utilization (XLA: GpuPerformanceModelBase)
+# ======================================================================
+
+def _operand_utilization(
+    consumer: HloInstruction,
+    operand: HloInstruction,
+) -> float:
+    """Estimate how much of the operand tensor is actually accessed.
+
+    XLA's ``GpuPerformanceModelBase::GetOperandUtilization`` computes the
+    ratio of bytes the consumer actually touches to the operand's total
+    bytes.  A ``broadcast`` re-reads each element multiple times
+    (utilization > 1), while a ``slice`` reads only a subset (utilization < 1).
+
+    Returns:
+        Utilization factor (1.0 = reads entire operand exactly once).
+    """
+    opcode = consumer.opcode
+
+    if opcode == "broadcast":
+        # Consumer reads every input element output_elements / input_elements times.
+        if operand.shape.num_elements > 0:
+            return consumer.shape.num_elements / operand.shape.num_elements
+        return 1.0
+
+    if opcode in ("slice", "dynamic-slice"):
+        # Consumer reads a subset of the operand.
+        if operand.shape.num_elements > 0:
+            return consumer.shape.num_elements / operand.shape.num_elements
+        return 1.0
+
+    # Default: reads entire operand once.
+    return 1.0
+
+
+# ======================================================================
+# Coalescing approximation
+# ======================================================================
+
+def _coalescing_factor(consumer: HloInstruction) -> float:
+    """Approximate memory coalescing efficiency for the consumer instruction.
+
+    XLA uses ``CoalescingAnalysis`` with symbolic tile analysis for accurate
+    results.  We approximate with opcode-based heuristics:
+
+    - ``transpose`` touching the innermost dimension: ~1/16 efficiency
+      (each warp accesses 32 × 4B = 128B but across a 64B cache line
+      only 4B/64B = 1/16 is useful for f32).
+    - ``gather``: ~0.25 efficiency (scattered access pattern).
+    - Default: 1.0 (fully coalesced).
+
+    Returns:
+        Coalescing factor in (0, 1].  Lower = worse coalescing = slower reads.
+    """
+    opcode = consumer.opcode
+
+    if opcode == "transpose":
+        # Check if the transpose involves the innermost dimension.
+        perm = consumer.attributes.get("dimensions", [])
+        if perm:
+            ndim = len(perm)
+            # If the last dimension in the permutation is not ndim-1,
+            # the innermost dim changed → poor coalescing.
+            if perm[-1] != ndim - 1:
+                return 0.0625  # 1/16
+        return 1.0
+
+    if opcode == "gather":
+        return 0.25
+
+    return 1.0
+
+
+# ======================================================================
+# Cache bandwidth modeling (XLA: L1/L2 speedup)
+# ======================================================================
+
+def _cache_bandwidth_multiplier(
+    operand_bytes: int,
+    gpu_specs: GPUSpecs,
+) -> float:
+    """Determine the bandwidth multiplier based on operand cache residency.
+
+    XLA models that small operands benefit from L1 or L2 cache bandwidth:
+    - Fits in shared memory (L1): ``kL1CacheSpeedup = 8.0``
+    - Fits in L2 cache: ``kL2CacheSpeedup = 2.5``
+    - Otherwise: HBM bandwidth (1.0)
+
+    Args:
+        operand_bytes: Total bytes of the operand tensor.
+        gpu_specs: GPU hardware specs with cache sizes and speedups.
+
+    Returns:
+        Bandwidth multiplier (>= 1.0).
+    """
+    if operand_bytes <= gpu_specs.shared_memory_per_sm:
+        return gpu_specs.l1_cache_speedup  # 8.0
+    elif operand_bytes <= gpu_specs.l2_cache_size:
+        return gpu_specs.l2_cache_speedup  # 2.5
+    else:
+        return 1.0
+
+
+# ======================================================================
+# Byte-traffic estimation (with utilization, coalescing, caching)
 # ======================================================================
 
 def _tensor_bytes(shape: HloShape) -> int:
@@ -165,30 +271,18 @@ def _tensor_bytes(shape: HloShape) -> int:
     return shape.total_bytes
 
 
-def compute_bytes(
+def compute_bytes_accessed(
     instruction: HloInstruction,
     instruction_map: Dict[str, HloInstruction],
     fused_intermediates: Optional[Set[str]] = None,
     fused_cluster_members: Optional[Set[str]] = None,
 ) -> int:
-    """Estimate the bytes read + written by *instruction*.
+    """Estimate the bytes read + written by *instruction* (simple version).
 
-    Operands whose names appear in *fused_intermediates* are assumed to reside
-    in registers / shared memory and therefore do **not** incur an HBM read.
-
-    If all consumers of this instruction are inside *fused_cluster_members*,
-    the write is also elided (the output stays in registers).
-
-    Args:
-        instruction: The instruction to analyze.
-        instruction_map: All instructions keyed by name (for consumer lookup).
-        fused_intermediates: Names of operands produced within the same
-            fusion cluster (reads skipped).
-        fused_cluster_members: Names of all instructions in the same fusion
-            cluster (writes skipped if all consumers are members).
-
-    Returns:
-        Estimated bytes accessed from/to global memory.
+    This is the legacy interface that returns raw byte counts without
+    utilization / coalescing / caching adjustments.  Used for memory
+    reduction metrics.  The full cost model uses ``_compute_read_time``
+    and ``_compute_write_time`` directly.
     """
     if fused_intermediates is None:
         fused_intermediates = set()
@@ -197,24 +291,18 @@ def compute_bytes(
 
     opcode = instruction.opcode
 
-    # Parameters and constants are read-only; their cost is accounted for
-    # by their *consumers*.
     if opcode in ("parameter", "constant"):
         return 0
 
     total_bytes = 0
 
-    # ---- Reads: operand tensors not already in registers ----
     for op_name in instruction.operand_names:
         if op_name in fused_intermediates:
-            continue  # produced in-register within the cluster
+            continue
         op_inst = instruction_map.get(op_name)
         if op_inst is not None:
             total_bytes += _tensor_bytes(op_inst.shape)
 
-    # ---- Write: output tensor ----
-    # Check whether *every* consumer is inside the same cluster.  If so, the
-    # output is consumed in-register and never written to HBM.
     all_consumers_fused = True
     if fused_cluster_members:
         for inst in instruction_map.values():
@@ -231,8 +319,100 @@ def compute_bytes(
     return total_bytes
 
 
+# Keep the old name for backward compatibility.
+compute_bytes = compute_bytes_accessed
+
+
 # ======================================================================
-# Cluster-level runtime estimation
+# Per-operand read time (with utilization, coalescing, cache)
+# ======================================================================
+
+def _compute_read_time(
+    instruction: HloInstruction,
+    instruction_map: Dict[str, HloInstruction],
+    gpu_specs: GPUSpecs,
+    fused_intermediates: Optional[Set[str]] = None,
+) -> float:
+    """Compute read time for all operands of *instruction* in seconds.
+
+    Accounts for operand utilization, coalescing, and L1/L2 cache.
+    Mirrors XLA's per-operand read time computation in
+    ``GpuPerformanceModel::EstimateRunTimes``.
+    """
+    if fused_intermediates is None:
+        fused_intermediates = set()
+
+    if instruction.opcode in ("parameter", "constant"):
+        return 0.0
+
+    bandwidth = gpu_specs.memory_bandwidth
+    if bandwidth <= 0:
+        return 0.0
+
+    coalescing = _coalescing_factor(instruction)
+    total_read_time = 0.0
+
+    for op_name in instruction.operand_names:
+        if op_name in fused_intermediates:
+            continue  # produced in-register within the cluster
+
+        op_inst = instruction_map.get(op_name)
+        if op_inst is None:
+            continue
+
+        raw_bytes = _tensor_bytes(op_inst.shape)
+        utilization = _operand_utilization(instruction, op_inst)
+        cache_mult = _cache_bandwidth_multiplier(raw_bytes, gpu_specs)
+
+        effective_bandwidth = bandwidth * coalescing * cache_mult
+        if effective_bandwidth <= 0:
+            effective_bandwidth = bandwidth  # fallback
+
+        total_read_time += (raw_bytes * utilization) / effective_bandwidth
+
+    return total_read_time
+
+
+def _compute_write_time(
+    instruction: HloInstruction,
+    instruction_map: Dict[str, HloInstruction],
+    gpu_specs: GPUSpecs,
+    fused_cluster_members: Optional[Set[str]] = None,
+) -> float:
+    """Compute write time for the output of *instruction* in seconds.
+
+    If all consumers are inside the same fused cluster, the write is
+    elided (the output stays in registers).
+    """
+    if instruction.opcode in ("parameter", "constant"):
+        return 0.0
+
+    bandwidth = gpu_specs.memory_bandwidth
+    if bandwidth <= 0:
+        return 0.0
+
+    if fused_cluster_members is None:
+        fused_cluster_members = set()
+
+    # Check whether *every* consumer is inside the same cluster.
+    all_consumers_fused = True
+    if fused_cluster_members:
+        for inst in instruction_map.values():
+            if instruction.name in inst.operand_names:
+                if inst.name not in fused_cluster_members:
+                    all_consumers_fused = False
+                    break
+    else:
+        all_consumers_fused = False
+
+    if not all_consumers_fused or instruction.is_root:
+        return _tensor_bytes(instruction.shape) / bandwidth
+
+    return 0.0
+
+
+# ======================================================================
+# Cluster-level runtime estimation (XLA-aligned)
 # ======================================================================
 
 def estimate_cluster_runtime(
@@ -241,7 +421,15 @@ def estimate_cluster_runtime(
     gpu_specs: GPUSpecs,
     computation_map: Optional[Dict[str, HloComputation]] = None,
 ) -> float:
-    """Estimate the runtime (in seconds) of a fused cluster via roofline.
+    """Estimate the runtime (in seconds) of a fused cluster.
+
+    Uses XLA's ``GpuPerformanceModel`` formula::
+
+        exec_time = max(compute_time, memory_time)
+                  + (1 - parallelism) * min(compute_time, memory_time)
+                  + kernel_launch_overhead
+
+    where ``parallelism = 0.95`` models 95% compute-memory overlap.
 
     Args:
         cluster_member_names: Set of instruction names in this cluster.
@@ -253,7 +441,8 @@ def estimate_cluster_runtime(
         Estimated runtime in seconds.
     """
     total_flops = 0
-    total_bytes = 0
+    total_read_time = 0.0
+    total_write_time = 0.0
 
     for name in cluster_member_names:
         inst = instruction_map.get(name)
@@ -261,10 +450,18 @@ def estimate_cluster_runtime(
             continue
 
         total_flops += compute_flops(inst, computation_map)
-        total_bytes += compute_bytes(
+
+        total_read_time += _compute_read_time(
             inst,
             instruction_map,
+            gpu_specs,
             fused_intermediates=cluster_member_names - {name},
+        )
+
+        total_write_time += _compute_write_time(
+            inst,
+            instruction_map,
+            gpu_specs,
             fused_cluster_members=cluster_member_names,
         )
 
@@ -277,9 +474,15 @@ def estimate_cluster_runtime(
     peak_flops = gpu_specs.peak_flops_fp16 if uses_fp16 else gpu_specs.peak_flops_fp32
 
     compute_time = total_flops / peak_flops if peak_flops > 0 else 0.0
-    memory_time = total_bytes / gpu_specs.memory_bandwidth if gpu_specs.memory_bandwidth > 0 else 0.0
+    memory_time = total_read_time + total_write_time
 
-    runtime = max(compute_time, memory_time) + gpu_specs.kernel_launch_overhead
+    # XLA overlap formula: 95% parallel, 5% serialized.
+    p = gpu_specs.compute_memory_parallelism
+    runtime = (
+        max(compute_time, memory_time)
+        + (1.0 - p) * min(compute_time, memory_time)
+        + gpu_specs.kernel_launch_overhead
+    )
     return runtime
 
 
