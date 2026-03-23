@@ -24,7 +24,13 @@ class GPUSpecs:
         shared_memory_per_sm: Shared memory per SM in bytes.
         num_sms: Number of streaming multiprocessors.
         kernel_launch_overhead: Fixed cost in seconds per kernel launch
-            (typically ~5 microseconds on modern GPUs).
+            (XLA uses 1 μs = ``kKernelLaunchOverhead``).
+        compute_memory_parallelism: Fraction of compute-memory overlap
+            (XLA's ``kMemoryComputeParallelism`` = 0.95).
+        l1_cache_speedup: Bandwidth multiplier for L1-resident operands
+            (XLA's ``kL1CacheSpeedup`` = 8.0).
+        l2_cache_speedup: Bandwidth multiplier for L2-resident operands
+            (XLA's ``kL2CacheSpeedup`` = 2.5).
     """
     name: str
     peak_flops_fp32: float       # FLOPS
@@ -34,6 +40,9 @@ class GPUSpecs:
     shared_memory_per_sm: int    # bytes
     num_sms: int
     kernel_launch_overhead: float  # seconds
+    compute_memory_parallelism: float = 0.95  # XLA kMemoryComputeParallelism
+    l1_cache_speedup: float = 8.0             # XLA kL1CacheSpeedup
+    l2_cache_speedup: float = 2.5             # XLA kL2CacheSpeedup
 
     # ------------------------------------------------------------------
     # Derived helpers
@@ -72,7 +81,7 @@ def v100_specs() -> GPUSpecs:
         l2_cache_size=6 * 1024 * 1024, # 6 MB
         shared_memory_per_sm=96 * 1024,  # 96 KB (configurable up to 96 KB)
         num_sms=80,
-        kernel_launch_overhead=5e-6,   # ~5 us
+        kernel_launch_overhead=1e-6,   # 1 μs (XLA kKernelLaunchOverhead)
     )
 
 
@@ -90,7 +99,7 @@ def a100_specs() -> GPUSpecs:
         l2_cache_size=40 * 1024 * 1024, # 40 MB
         shared_memory_per_sm=164 * 1024,  # 164 KB (configurable)
         num_sms=108,
-        kernel_launch_overhead=5e-6,    # ~5 us
+        kernel_launch_overhead=1e-6,    # 1 μs (XLA kKernelLaunchOverhead)
     )
 
 
@@ -108,7 +117,7 @@ def h100_specs() -> GPUSpecs:
         l2_cache_size=50 * 1024 * 1024, # 50 MB
         shared_memory_per_sm=228 * 1024,  # 228 KB
         num_sms=132,
-        kernel_launch_overhead=5e-6,    # ~5 us
+        kernel_launch_overhead=1e-6,    # 1 μs (XLA kKernelLaunchOverhead)
     )
 
 
