@@ -207,3 +207,20 @@ marimo/_lsp/
 __marimo__/
 .DS_Store
 .idea/
+
+# Checkpoints
+checkpoint/
+checkpoints/
+
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.h5
+*.joblib
+
+# Logs
+logs/
+log/
+
+*.log
