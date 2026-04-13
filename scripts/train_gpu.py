@@ -35,15 +35,18 @@ from src.utils.gpu_specs import get_gpu_specs
 # =====================================================================
 # Configuration
 # =====================================================================
-NUM_UPDATES = 500
+NUM_UPDATES = 2000
 ROLLOUTS_PER_UPDATE = 8
 LR = 3e-4
 GPU_TARGET = "a100"  # cost model target (doesn't need to match training GPU)
 HLO_DIR = "../hlos"
 CHECKPOINT_DIR = "./checkpoints"
-LOG_INTERVAL = 10
-CHECKPOINT_INTERVAL = 50
+LOG_INTERVAL = 50
+CHECKPOINT_INTERVAL = 200
 SA_ITERATIONS = 1000  # for final evaluation
+
+# Graphs with trivial fusion spaces (too few fusable nodes for RL to add value)
+EXCLUDE_DIRS = {"mlp_down_proj", "gqa_out_proj"}
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -66,6 +69,12 @@ envs = []
 env_names = []
 
 for hlo_file in hlo_files:
+    # Skip graphs with trivially small fusion spaces
+    parent_dir = os.path.basename(os.path.dirname(hlo_file))
+    if parent_dir in EXCLUDE_DIRS:
+        print(f"  Skipped (excluded): {parent_dir}/{os.path.basename(hlo_file)}")
+        continue
+
     try:
         module = parse_hlo_file(hlo_file)
         graph_data = build_graph(module)
