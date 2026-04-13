@@ -44,6 +44,15 @@ CHECKPOINT_DIR = "./checkpoints"
 LOG_INTERVAL = 50
 CHECKPOINT_INTERVAL = 200
 SA_ITERATIONS = 1000  # for final evaluation
+STOCHASTIC_K = 50     # number of stochastic samples during evaluation
+
+# Entropy regularization: linear decay over training
+ENTROPY_START = 0.01
+ENTROPY_END = 0.001
+
+# Curriculum learning: stage 1 uses medium graphs only, stage 2 uses all
+CURRICULUM_STAGE2 = 500  # switch to all graphs at this update
+LARGE_GRAPH_THRESHOLD = 250  # num_fusable above this = "large" graph
 
 # Graphs with trivial fusion spaces (too few fusable nodes for RL to add value)
 EXCLUDE_DIRS = {"mlp_down_proj", "gqa_out_proj"}
@@ -100,6 +109,22 @@ if not envs:
 print(f"\nTotal environments: {len(envs)}")
 
 # =====================================================================
+# Curriculum learning: partition into medium and large graphs
+# =====================================================================
+medium_envs = [e for e in envs if e.num_fusable <= LARGE_GRAPH_THRESHOLD]
+medium_names = [n for e, n in zip(envs, env_names) if e.num_fusable <= LARGE_GRAPH_THRESHOLD]
+large_envs = [e for e in envs if e.num_fusable > LARGE_GRAPH_THRESHOLD]
+large_names = [n for e, n in zip(envs, env_names) if e.num_fusable > LARGE_GRAPH_THRESHOLD]
+
+print(f"  Medium graphs (≤{LARGE_GRAPH_THRESHOLD} fusable): {len(medium_envs)} — {medium_names}")
+print(f"  Large graphs  (>{LARGE_GRAPH_THRESHOLD} fusable): {len(large_envs)} — {large_names}")
+print(f"  Curriculum: stage 1 (updates 1–{CURRICULUM_STAGE2}) medium only, stage 2 (updates {CURRICULUM_STAGE2+1}–{NUM_UPDATES}) all")
+
+# Graph-size-aware sampling weights (proportional to num_fusable)
+medium_weights = [e.num_fusable for e in medium_envs]
+all_weights = [e.num_fusable for e in envs]
+
+# =====================================================================
 # Build model
 # =====================================================================
 policy = GOFusionPolicy(
@@ -109,7 +134,7 @@ policy = GOFusionPolicy(
     segment_size=256, num_iterations=3, d_ff=512, dropout=0.1,
 ).to(device)
 value_net = ValueNetwork(hidden_dim=128).to(device)
-ppo = PPO(policy, value_net, lr=LR, clip_ratio=0.2, entropy_coeff=0.01,
+ppo = PPO(policy, value_net, lr=LR, clip_ratio=0.2, entropy_coeff=ENTROPY_START,
           value_loss_coeff=0.5, max_grad_norm=0.5, num_epochs=4)
 
 total_params = sum(p.numel() for p in policy.parameters()) + sum(p.numel() for p in value_net.parameters())
@@ -130,8 +155,22 @@ for update in range(1, NUM_UPDATES + 1):
     episode_rewards = []
     episode_infos = []
 
+    # Entropy decay: linear from ENTROPY_START to ENTROPY_END
+    ppo.entropy_coeff = ENTROPY_START - (ENTROPY_START - ENTROPY_END) * (update - 1) / (NUM_UPDATES - 1)
+
+    # Curriculum: select environment pool and weights
+    if update <= CURRICULUM_STAGE2:
+        current_envs = medium_envs
+        current_weights = medium_weights
+    else:
+        current_envs = envs
+        current_weights = all_weights
+        if update == CURRICULUM_STAGE2 + 1:
+            print(f"\n>>> CURRICULUM STAGE 2: introducing all {len(envs)} graphs (including large) <<<\n")
+            sys.stdout.flush()
+
     for r in range(ROLLOUTS_PER_UPDATE):
-        env = envs[r % len(envs)]
+        env = random.choices(current_envs, weights=current_weights, k=1)[0]
 
         policy.eval()
         value_net.eval()
@@ -180,7 +219,7 @@ for update in range(1, NUM_UPDATES + 1):
             f"Reward: {mean_reward:+.4f} (best: {best_reward:+.4f}) | "
             f"PL: {metrics['policy_loss']:+.5f} | "
             f"VL: {metrics['value_loss']:.4f} | "
-            f"Ent: {metrics['entropy']:.3f} | "
+            f"Ent: {metrics['entropy']:.3f} (coeff={ppo.entropy_coeff:.4f}) | "
             f"Clusters: {np.mean(n_clusters):.0f} | "
             f"{elapsed:.1f}s"
         )
@@ -254,9 +293,10 @@ for env_idx, (env, name) in enumerate(zip(envs, env_names)):
     go_runtime = estimate_total_runtime(go_cluster_sets, instruction_map, gpu_specs, computation_map_env)
     print(f"  GO policy:      {go_runtime:.6e} s  ({len(go_clusters)} clusters)")
 
-    # Stochastic samples
+    # Stochastic samples (best-of-K as primary strategy)
     stoch_runtimes = []
-    for _ in range(10):
+    stoch_clusters_list = []
+    for _ in range(STOCHASTIC_K):
         with torch.no_grad():
             probs, _ = policy(obs_x, obs_ei, obs_oc)
             dist = torch.distributions.Categorical(probs)
@@ -270,8 +310,11 @@ for env_idx, (env, name) in enumerate(zip(envs, env_names)):
         clusters = simulate_fusion(instructions=instructions, edges=edges, priorities=prios)
         rt = estimate_total_runtime([c.members for c in clusters], instruction_map, gpu_specs, computation_map_env)
         stoch_runtimes.append(rt)
-    best_stoch = min(stoch_runtimes)
-    print(f"  GO stochastic:  mean={np.mean(stoch_runtimes):.6e}, best={best_stoch:.6e}")
+        stoch_clusters_list.append(clusters)
+    best_stoch_idx = int(np.argmin(stoch_runtimes))
+    best_stoch = stoch_runtimes[best_stoch_idx]
+    best_stoch_clusters = stoch_clusters_list[best_stoch_idx]
+    print(f"  GO stochastic (K={STOCHASTIC_K}): mean={np.mean(stoch_runtimes):.6e}, best={best_stoch:.6e}")
 
     # Baselines
     baseline_runtimes = run_all_baselines(
@@ -280,11 +323,11 @@ for env_idx, (env, name) in enumerate(zip(envs, env_names)):
         computation_map=computation_map_env, verbose=True,
     )
 
-    # Results table
-    go_cluster_members = [list(c.members) for c in go_clusters]
-    cluster_stats = FusionMetrics.compute_cluster_stats(go_cluster_members)
+    # Results table (using stochastic best as primary GO runtime)
+    stoch_cluster_members = [list(c.members) for c in best_stoch_clusters]
+    cluster_stats = FusionMetrics.compute_cluster_stats(stoch_cluster_members)
     results_table = FusionMetrics.format_results_table(
-        go_runtime=go_runtime, baselines=baseline_runtimes, go_cluster_stats=cluster_stats,
+        go_runtime=best_stoch, baselines=baseline_runtimes, go_cluster_stats=cluster_stats,
     )
     print(results_table)
 
